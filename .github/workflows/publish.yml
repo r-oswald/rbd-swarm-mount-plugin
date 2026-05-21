@@ -1,0 +1,40 @@
+name: publish plugin
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: log in to ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: build rootfs
+        run: sudo make rootfs
+
+      - name: make rootfs readable by docker plugin create (which runs as runner uid)
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" plugin
+          sudo chmod -R u+r plugin
+
+      - name: create + push writer plugin
+        run: |
+          make create
+          make push
+
+      - name: create + push read-only plugin
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" plugin
+          sudo chmod -R u+r plugin
+          make create-ro
+          make push-ro

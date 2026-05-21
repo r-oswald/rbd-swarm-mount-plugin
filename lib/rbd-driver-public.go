@@ -1,17 +1,18 @@
 package dockerVolumeRbd
 
 import (
-	"github.com/sirupsen/logrus"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sync"
+	"time"
+
 	"github.com/ceph/go-ceph/rados"
 	"github.com/ceph/go-ceph/rbd"
+	"github.com/sirupsen/logrus"
 	"github.com/wetopi/docker-volume-rbd/lib/try"
-	"sync"
-	"path/filepath"
-	"fmt"
-	"os/exec"
-	"time"
-	"regexp"
-	"os"
 )
 
 type rbdDriver struct {
@@ -25,9 +26,8 @@ type rbdDriver struct {
 }
 
 var (
-	rbdUnmapBusyRegexp = regexp.MustCompile(`^exit status 16$`)
-    rbdHasNoWatchersRegexp = regexp.MustCompile(`^Watchers: none$`)
-	rbdBusyRegexp = regexp.MustCompile(`ret=-16$`)
+	rbdBusyRegexp      = regexp.MustCompile(`ret=-16$`)
+	rbdNotMappedRegexp = regexp.MustCompile(`not a mapped image or snapshot`)
 )
 
 
@@ -197,34 +197,76 @@ func (d *rbdDriver) RemoveRbdImageWithRetries(imageName string) error {
 }
 
 
+var (
+	// brief wait for any prior kernel mapping of this image to clear; if it
+	// doesn't, force-unmap (handles swarm-scheduling races and stuck cleanups
+	// where the prior container is gone but XFS unmount is still in progress)
+	preMapSettleTimeout = 2 * time.Second
+	preMapSettlePoll    = 100 * time.Millisecond
+
+	// bounded wait for udev to create the /dev/rbd/<pool>/<image> symlink after rbd map
+	udevSettleTimeout = 3 * time.Second
+	udevSettlePoll    = 50 * time.Millisecond
+)
+
 func (d *rbdDriver) MountRbdImage(imageName string) (err error, mountpoint string) {
 	logrus.Debugf("volume-rbd Name=%s Message=MountRbdImage map and mount", imageName)
 
-
-    err = d.errIfRbdImageHasWatchers(imageName)
-	if err != nil {
-        logrus.Warnf("volume-rbd Name=%s Message=MountRbdImage image has watchers:", imageName, err)
+	// in RW mode wait briefly for any prior kernel rbd device for this image
+	// to be unmapped, then force-unmap if still present so our new map gets
+	// a clean slot. Skipped in RO mode where shared mounts are intentional.
+	if !isReadOnly() {
+		deadline := time.Now().Add(preMapSettleTimeout)
+		for {
+			devs := d.findKernelDevicesForImage(imageName)
+			if len(devs) == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				for _, dev := range devs {
+					logrus.Warnf("volume-rbd Name=%s Message=force-unmapping stale device %s before remap", imageName, dev)
+					shWithDefaultTimeout("rbd", "unmap", dev)
+				}
+				break
+			}
+			time.Sleep(preMapSettlePoll)
+		}
 	}
-
-
 
 	err = d.mapImage(imageName)
 	if err != nil {
-		return fmt.Errorf("unable to map: %s", imageName, err), ""
+		defer d.FreeUpRbdImage(imageName)
+		return fmt.Errorf("unable to map %s: %s", imageName, err), ""
 	}
 
+	// wait for udev to create the device symlink
+	device := d.getTheDevice(imageName)
+	deadline := time.Now().Add(udevSettleTimeout)
+	for {
+		if _, statErr := os.Stat(device); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			defer d.FreeUpRbdImage(imageName)
+			return fmt.Errorf("device %s did not appear within %s after rbd map", device, udevSettleTimeout), ""
+		}
+		time.Sleep(udevSettlePoll)
+	}
+
+	// drop any stale kernel buffer cache from prior use of this device slot,
+	// so blkid and mount read fresh data from Ceph
+	shWithDefaultTimeout("blockdev", "--flushbufs", device)
 
 	// check for mountdir - create if necessary
 	mountpoint = d.GetMountPointPath(imageName)
-	err = os.MkdirAll(mountpoint, os.ModeDir | os.FileMode(int(0775)))
+	err = os.MkdirAll(mountpoint, os.ModeDir|os.FileMode(int(0775)))
 	if err != nil {
 		defer d.FreeUpRbdImage(imageName)
-		return fmt.Errorf("unable to make mountpoint: %s", mountpoint, err), ""
+		return fmt.Errorf("unable to make mountpoint %s: %s", mountpoint, err), ""
 	}
 
-
 	// mount
-	mountOptions := os.Getenv("MOUNT_OPTIONS")
+	mountOptions := d.mountOptionsFor(imageName)
 	err = d.mountImage(imageName, mountOptions)
 	if err != nil {
 		defer d.FreeUpRbdImage(imageName)
@@ -232,43 +274,34 @@ func (d *rbdDriver) MountRbdImage(imageName string) (err error, mountpoint strin
 	}
 
 	return err, mountpoint
-
 }
 
 /**
  * Freeing Up an RBD image means
  * unmount + unmap and remove mountpoint
  *
- * We do all this silently, we want the freeUp process idempotent
+ * Idempotent: returns the first real error, treats already-clean state as benign
  */
 func (d *rbdDriver) FreeUpRbdImage(imageName string) error {
 	logrus.Debugf("volume-rbd Name=%s Message=free up image", imageName)
 
+	var firstErr error
 
-    // silently unmount
-    err := d.unmountDevice(imageName)
-    if err != nil {
-        logrus.Warnf("volume-rbd Name=%s Message=unable to unmount:", imageName, err)
-    }
+	if err := d.unmountDevice(imageName); err != nil {
+		logrus.Warnf("volume-rbd Name=%s Message=unable to unmount: %s", imageName, err)
+		firstErr = err
+	}
 
+	if err := d.unmapImage(imageName); err != nil && firstErr == nil {
+		firstErr = err
+	}
 
-    // silently unmap
-    err = d.unmapImage(imageName)
-    if err != nil {
-        logrus.Warnf("volume-rbd Name=%s Message=unable to unmap:", imageName, err)
-    }
-
-
-	// silently remove mountpoint
 	mountpoint := d.GetMountPointPath(imageName)
+	if err := os.Remove(mountpoint); err != nil && !os.IsNotExist(err) {
+		logrus.Warnf("volume-rbd Name=%s Message=unable to remove mountpoint(%s): %s", imageName, mountpoint, err)
+	}
 
-    err = os.Remove(mountpoint)
-    if err != nil {
-        logrus.Warnf("volume-rbd Name=%s Message=unable to remove mountpoint(%s): %s", imageName, mountpoint, err)
-    }
-
-
-	return nil
+	return firstErr
 }
 
 

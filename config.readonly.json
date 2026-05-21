@@ -95,7 +95,7 @@
       "name": "RBD_READONLY",
       "Description": "Internal flag — choose the read-only image variant instead of setting this",
       "settable": [],
-      "value": "0"
+      "value": "1"
     }
   ],
   "interface": {

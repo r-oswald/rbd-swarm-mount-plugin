@@ -1,3 +1,4 @@
 docker-volume-rbd
 plugin/
-vendor/
+vendor/.env
+.env

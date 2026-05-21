@@ -1,10 +1,12 @@
 package dockerVolumeRbd
 
 import (
-	"time"
+	"bytes"
+	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
-	"errors"
+	"time"
 )
 
 
@@ -13,10 +15,17 @@ var (
 )
 
 // sh is a simple os.exec Command tool, returns trimmed string output
+// (stderr is attached to the error on failure)
 func sh(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
 	out, err := cmd.Output()
+	if err != nil {
+		err = fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
 	return strings.Trim(string(out), " \n"), err
 }
 
@@ -47,8 +56,6 @@ func shWithTimeout(howLong time.Duration, name string, args ...string) (string, 
 	case <-time.After(howLong):
 		return "", errors.New("timeout reached")
 	}
-
-	return "", nil
 }
 
 

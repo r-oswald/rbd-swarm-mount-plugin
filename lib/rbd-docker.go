@@ -1,11 +1,11 @@
 package dockerVolumeRbd
 
 import (
-	"github.com/sirupsen/logrus"
-	"github.com/docker/go-plugins-helpers/volume"
-	"strconv"
 	"fmt"
+	"github.com/docker/go-plugins-helpers/volume"
+	"github.com/sirupsen/logrus"
 	"os"
+	"strconv"
 )
 
 
@@ -15,12 +15,22 @@ func (d *rbdDriver) Create(r *volume.CreateRequest) error {
 	d.Lock()
 	defer d.Unlock()
 
-    var err error
-	var fstype string = os.Getenv("VOLUME_FSTYPE")
-	var mkfsOptions string = os.Getenv("VOLUME_MKFS_OPTIONS")
-	var size  uint64 = os.Getenv("VOLUME_SIZE")
-	var order os.Getenv("VOLUME_ORDER")
+	// Default values with error checking
+	size, err := parseUintEnv("VOLUME_SIZE", 10, 64)
+	if err != nil {
+		return fmt.Errorf("error parsing VOLUME_SIZE from env: %v", err)
+	}
 
+	order, err := parseIntEnv("VOLUME_ORDER")
+	if err != nil {
+		return fmt.Errorf("error parsing VOLUME_ORDER from env: %v", err)
+	}
+
+	fstype := os.Getenv("VOLUME_FSTYPE")
+	mkfsOptions := os.Getenv("VOLUME_MKFS_OPTIONS")
+	mountOptionsOverride := ""
+
+	// Processing options
 	for key, val := range r.Options {
 		switch key {
 		case "size":
@@ -41,11 +51,14 @@ func (d *rbdDriver) Create(r *volume.CreateRequest) error {
 		case "mkfsOptions":
 			mkfsOptions = val
 
+		case "mountOptions":
+			mountOptionsOverride = val
+
 		case "pool":
-		    // ignored ... backward compatibility
+			// ignored for backward compatibility
 
 		default:
-			return fmt.Errorf("unknown option %q", val)
+			return fmt.Errorf("unknown option '%s'", key)
 		}
 	}
 
@@ -70,9 +83,30 @@ func (d *rbdDriver) Create(r *volume.CreateRequest) error {
         return fmt.Errorf("volume-rbd Name=%s Request=Create Message=unable to create ceph rbd image: %s", r.Name, err)
     }
 
+    // persist per-volume mount options as rbd image-meta so Mount can read
+    // them from any plugin instance on any node
+    if mountOptionsOverride != "" {
+        d.setImageMeta(r.Name, "mount-options", mountOptionsOverride)
+    }
+
 	return nil
 }
 
+func parseUintEnv(key string, base int, bitSize int) (uint64, error) {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return 0, fmt.Errorf("config variable %s not set", key)
+	}
+	return strconv.ParseUint(valStr, base, bitSize)
+}
+
+func parseIntEnv(key string) (int, error) {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return 0, fmt.Errorf("config variable %s not set", key)
+	}
+	return strconv.Atoi(valStr)
+}
 
 func (d *rbdDriver) List() (*volume.ListResponse, error) {
 	logrus.Infof("volume-rbd Request=List")

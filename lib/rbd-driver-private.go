@@ -1,39 +1,137 @@
 package dockerVolumeRbd
 
 import (
-	"github.com/sirupsen/logrus"
-	"github.com/ceph/go-ceph/rbd"
-	"golang.org/x/sys/unix"
+	"errors"
+	"os"
 	"path/filepath"
-	"fmt"
+	"strings"
+
+	"github.com/ceph/go-ceph/rbd"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 
 func (d *rbdDriver) mapImage(imageName string) error {
 	logrus.Debugf("volume-rbd Name=%s Message=rbd map", imageName)
 
-	_, err := d.rbdsh("map", filepath.Join(d.conf["pool"], d.conf["namespace"], imageName))
-
+	path := filepath.Join(d.conf["pool"], d.conf["namespace"], imageName)
+	if isReadOnly() {
+		_, err := d.rbdsh("map", "--read-only", path)
+		return err
+	}
+	_, err := d.rbdsh("map", path)
 	return err
 }
 
+// per-volume settings are persisted in rbd image-meta under this prefix
+const imageMetaPrefix = "docker-volume-rbd."
 
+// isReadOnly returns true when this plugin instance is configured to
+// map+mount volumes read-only (RBD_READONLY=1). Read-only is a consumer-side
+// decision — for mixed RW/RO access deploy a separate plugin alias with
+// RBD_READONLY=1 for the read-only consumers.
+func isReadOnly() bool {
+	return os.Getenv("RBD_READONLY") == "1"
+}
+
+// mountOptionsFor returns the mount options string for this image.
+// Precedence: per-volume image-meta override → MOUNT_OPTIONS env var → "".
+func (d *rbdDriver) mountOptionsFor(imageName string) string {
+	if v := d.getImageMeta(imageName, "mount-options"); v != "" {
+		return v
+	}
+	return os.Getenv("MOUNT_OPTIONS")
+}
+
+// getImageMeta fetches a single image-meta value or empty string on any error/unset
+func (d *rbdDriver) getImageMeta(imageName, key string) string {
+	out, err := d.rbdsh("image-meta", "get", imageName, imageMetaPrefix+key)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// setImageMeta stores a key/value; logs but doesn't fail on error.
+// The "--" separator prevents rbd CLI from parsing value as a flag when
+// value starts with "--" (e.g. mount options "--options=noatime,...").
+func (d *rbdDriver) setImageMeta(imageName, key, value string) {
+	if _, err := d.rbdsh("image-meta", "set", imageName, imageMetaPrefix+key, "--", value); err != nil {
+		logrus.Warnf("volume-rbd Name=%s Message=unable to set image-meta %s: %s", imageName, key, err)
+	}
+}
+
+
+// unmapImage finds every kernel rbd device for this image and unmaps each
+// by device path. Avoids the ambiguity of `rbd unmap <pool>/<image>` when
+// multiple kernel devices exist for the same image (e.g. after a failed
+// remount left a stale device behind).
 func (d *rbdDriver) unmapImage(imageName string) error {
 	logrus.Debugf("volume-rbd Name=%s Message=rbd unmap", imageName)
 
-	_, err := d.rbdsh("unmap", filepath.Join(d.conf["pool"], d.conf["namespace"], imageName))
-
-	if err != nil {
-		// NOTE: rbd unmap exits 16 if device is still being used - unlike umount.  try to recover differently in that case
-		if rbdUnmapBusyRegexp.MatchString(err.Error()) {
-			return err
-		}
-
-		logrus.Errorf("volume-rbd Name=%s Message=rbd unmap: %s", imageName, err.Error())
-		// other error, continue and fail safe
+	devices := d.findKernelDevicesForImage(imageName)
+	if len(devices) == 0 {
+		return nil
 	}
 
-	return nil
+	var firstErr error
+	for _, dev := range devices {
+		_, err := shWithDefaultTimeout("rbd", "unmap", dev)
+		if err == nil {
+			continue
+		}
+		if rbdNotMappedRegexp.MatchString(err.Error()) {
+			continue
+		}
+		logrus.Warnf("volume-rbd Name=%s Message=rbd unmap %s failed: %s", imageName, dev, err)
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+
+// findKernelDevicesForImage enumerates /sys/bus/rbd/devices and returns
+// /dev/rbdN paths whose pool+namespace+name match this image.
+func (d *rbdDriver) findKernelDevicesForImage(imageName string) []string {
+	entries, err := os.ReadDir("/sys/bus/rbd/devices")
+	if err != nil {
+		return nil
+	}
+
+	pool := d.conf["pool"]
+	namespace := d.conf["namespace"]
+
+	var devices []string
+	for _, entry := range entries {
+		base := filepath.Join("/sys/bus/rbd/devices", entry.Name())
+
+		if name, err := readSysfsFile(base, "name"); err != nil || name != imageName {
+			continue
+		}
+		if p, err := readSysfsFile(base, "pool"); err != nil || p != pool {
+			continue
+		}
+		// namespace file may be absent on older kernels; absence == empty namespace
+		ns, _ := readSysfsFile(base, "namespace")
+		if ns != namespace {
+			continue
+		}
+
+		devices = append(devices, "/dev/rbd"+entry.Name())
+	}
+	return devices
+}
+
+
+func readSysfsFile(dir, name string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 
@@ -41,14 +139,54 @@ func (d *rbdDriver) mountImage(imageName string, mountOptions string) error {
 
     device := d.getTheDevice(imageName)
     mountpoint := d.GetMountPointPath(imageName)
+    fstype := detectFstype(device)
+
+    // XFS refuses to mount when the UUID is already mounted elsewhere; nouuid bypasses
+    // this safety, which is what we want when an old client's unmount is still in flight
+    // (no concurrent live writers — the old container is gone, the kernel will share
+    // the superblock and the old mount completes cleanup independently)
+    if fstype == "xfs" {
+        if mountOptions == "" {
+            mountOptions = "-o nouuid"
+        } else {
+            mountOptions = mountOptions + ",nouuid"
+        }
+    }
+    if isReadOnly() {
+        if mountOptions == "" {
+            mountOptions = "-o ro"
+        } else {
+            mountOptions = mountOptions + ",ro"
+        }
+        // device is mapped --read-only so the kernel cannot replay any
+        // pending journal; skip recovery (safe — we're a consumer-side reader)
+        switch fstype {
+        case "xfs":
+            mountOptions = mountOptions + ",norecovery"
+        case "ext4":
+            mountOptions = mountOptions + ",noload"
+        }
+    }
 
 	logrus.Debugf("volume-rbd Name=%s Message=mount %s %s %s", imageName, mountOptions, device, mountpoint)
 
-	// err := unix.Mount(device, mountpoint, "auto", 0, "")
-    // note unix.Mount does not work with our aliased device, we user the sh version.
+    if fstype != "" {
+        _, err := shWithDefaultTimeout("mount", "-t", fstype, mountOptions, device, mountpoint)
+        return err
+    }
     _, err := shWithDefaultTimeout("mount", mountOptions, device, mountpoint)
-
     return err
+}
+
+// detectFstype returns the filesystem type on the device by parsing blkid;
+// returns "" if blkid is unavailable or can't identify it, in which case mount
+// will auto-detect.
+func detectFstype(device string) string {
+    out, err := shWithDefaultTimeout("blkid", "-o", "value", "-s", "TYPE", device)
+    if err != nil {
+        return ""
+    }
+    return strings.TrimSpace(out)
 }
 
 
@@ -57,24 +195,20 @@ func (d *rbdDriver) unmountDevice(imageName string) error {
     mountpoint := d.GetMountPointPath(imageName)
 	logrus.Debugf("volume-rbd Message=umount %s", mountpoint)
 
-	err := unix.Unmount(mountpoint, 0)
-
-	return err
-}
-
-
-func (d *rbdDriver) errIfRbdImageHasWatchers(imageName string) error {
-
-	status, err := d.rbdsh("status", imageName)
-	if err != nil {
-		return err
-	}
-
-    if rbdHasNoWatchersRegexp.MatchString(status) {
-        return nil
+    // mounts can stack at the same path (rapid rollovers under nouuid); unmount all layers
+    var lastErr error
+    for i := 0; i < 10; i++ {
+        err := unix.Unmount(mountpoint, 0)
+        if err == nil {
+            continue
+        }
+        if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOENT) {
+            return nil
+        }
+        lastErr = err
+        break
     }
-
-    return fmt.Errorf("image with %s", status)
+    return lastErr
 }
 
 
