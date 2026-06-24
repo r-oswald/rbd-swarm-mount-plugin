@@ -217,6 +217,13 @@ func xfsLogInconsistent(device string) bool {
     if err != nil {
         return false
     }
+    // kernel logs use the /dev/rbdN node name, but getTheDevice returns
+    // the udev symlink /dev/rbd/<pool>/<image>; resolve so the needle
+    // matches what the kernel actually prints
+    real, rerr := filepath.EvalSymlinks(device)
+    if rerr == nil {
+        device = real
+    }
     needle := "(" + strings.TrimPrefix(device, "/dev/") + "):"
     cutoff := time.Now().Add(-xfsLogScrapeWindow)
     for _, line := range strings.Split(out, "\n") {
