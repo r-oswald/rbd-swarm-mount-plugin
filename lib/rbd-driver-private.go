@@ -2,9 +2,11 @@ package dockerVolumeRbd
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/ceph/go-ceph/rbd"
 	"github.com/sirupsen/logrus"
@@ -77,6 +79,10 @@ func (d *rbdDriver) unmapImage(imageName string) error {
 
 	var firstErr error
 	for _, dev := range devices {
+		// flush the block-device buffer cache so any writes the kernel was
+		// still draining at umount reach the rbd image before we unmap
+		shWithDefaultTimeout("blockdev", "--flushbufs", dev)
+
 		_, err := shWithDefaultTimeout("rbd", "unmap", dev)
 		if err == nil {
 			continue
@@ -170,12 +176,77 @@ func (d *rbdDriver) mountImage(imageName string, mountOptions string) error {
 
 	logrus.Debugf("volume-rbd Name=%s Message=mount %s %s %s", imageName, mountOptions, device, mountpoint)
 
+    err := tryMount(fstype, mountOptions, device, mountpoint)
+    if err == nil {
+        return nil
+    }
+    // when XFS sees on-disk metadata ahead of the journal (typical after the
+    // previous container was SIGKILL'd before the journal was fully flushed),
+    // the kernel refuses to mount. xfs_repair -L zeros the dirty log so the
+    // mount succeeds; any app-level WAL replays on startup
+    if fstype == "xfs" && xfsLogInconsistent(device) {
+        logrus.Warnf("volume-rbd Name=%s Message=xfs log inconsistent on %s; running xfs_repair -L", imageName, device)
+        if _, rerr := shWithDefaultTimeout("xfs_repair", "-L", device); rerr != nil {
+            return fmt.Errorf("xfs_repair -L %s: %s", device, rerr)
+        }
+        return tryMount(fstype, mountOptions, device, mountpoint)
+    }
+    return err
+}
+
+func tryMount(fstype, mountOptions, device, mountpoint string) error {
     if fstype != "" {
         _, err := shWithDefaultTimeout("mount", "-t", fstype, mountOptions, device, mountpoint)
         return err
     }
     _, err := shWithDefaultTimeout("mount", mountOptions, device, mountpoint)
     return err
+}
+
+// xfsLogInconsistent reports whether the kernel ring buffer shows a recent
+// XFS log/metadata LSN mismatch for the given device. Used to distinguish the
+// recoverable "log ahead of fs" case from a genuinely bad mount.
+//
+// Only entries within xfsLogScrapeWindow of now are considered, so stale
+// errors from a prior incarnation of the same /dev/rbdN slot don't trigger a
+// false-positive xfs_repair on a now-healthy image.
+const xfsLogScrapeWindow = 60 * time.Second
+
+func xfsLogInconsistent(device string) bool {
+    out, err := shWithDefaultTimeout("dmesg", "-T", "--ctime")
+    if err != nil {
+        return false
+    }
+    needle := "(" + strings.TrimPrefix(device, "/dev/") + "):"
+    cutoff := time.Now().Add(-xfsLogScrapeWindow)
+    for _, line := range strings.Split(out, "\n") {
+        if !strings.Contains(line, needle) {
+            continue
+        }
+        if !dmesgLineRecent(line, cutoff) {
+            continue
+        }
+        if strings.Contains(line, "log mount/recovery failed") ||
+            strings.Contains(line, "Metadata has LSN") {
+            return true
+        }
+    }
+    return false
+}
+
+// dmesgLineRecent returns true if the bracketed ctime prefix is at or after
+// cutoff. Lines without a parseable timestamp (older dmesg builds, truncated
+// lines) are treated as recent so we don't lose the self-heal path entirely.
+func dmesgLineRecent(line string, cutoff time.Time) bool {
+    end := strings.IndexByte(line, ']')
+    if end < 2 || line[0] != '[' {
+        return true
+    }
+    t, err := time.ParseInLocation("Mon Jan _2 15:04:05 2006", line[1:end], time.Local)
+    if err != nil {
+        return true
+    }
+    return !t.Before(cutoff)
 }
 
 // detectFstype returns the filesystem type on the device by parsing blkid;
