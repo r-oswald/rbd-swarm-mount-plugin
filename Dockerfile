@@ -1,4 +1,4 @@
-FROM quay.io/ceph/ceph:v19.2.3 as go-builder
+FROM quay.io/ceph/ceph:v19.2.4 as go-builder
 
 LABEL org.opencontainers.image.source="https://github.com/r-oswald/rbd-swarm-mount-plugin"
 LABEL org.opencontainers.image.description="Docker volume plugin for Ceph RBD"
@@ -36,7 +36,7 @@ RUN set -ex \
  && go install
 
 
-FROM quay.io/ceph/ceph:v19.2.3
+FROM quay.io/ceph/ceph:v19.2.4
 
 LABEL org.opencontainers.image.source="https://github.com/r-oswald/rbd-swarm-mount-plugin"
 LABEL org.opencontainers.image.description="Docker volume plugin for Ceph RBD"
