@@ -7,8 +7,8 @@ Maps Ceph RBD images as Docker volumes so containers and Docker Swarm services c
 
 | Image | For |
 |---|---|
-| `ghcr.io/r-oswald/rbd-swarm-mount-plugin:4.2.0` | Writers |
-| `ghcr.io/r-oswald/rbd-swarm-mount-plugin-ro:4.2.0` | Read-only consumers |
+| `ghcr.io/r-oswald/rbd-swarm-mount-plugin:4.2.1` | Writers |
+| `ghcr.io/r-oswald/rbd-swarm-mount-plugin-ro:4.2.1` | Read-only consumers |
 
 The RO variant maps with `rbd map --read-only` and mounts with `-o ro,nouuid,norecovery` (XFS) or `-o ro,noload` (ext4).
 
@@ -25,7 +25,7 @@ The RO variant maps with `rbd map --read-only` and mounts with `-o ro,nouuid,nor
 On every node that should be able to mount RBD volumes:
 
 ```bash
-docker plugin install ghcr.io/r-oswald/rbd-swarm-mount-plugin:4.2.0 \
+docker plugin install ghcr.io/r-oswald/rbd-swarm-mount-plugin:4.2.1 \
   --alias rbd \
   --grant-all-permissions \
   RBD_CONF_POOL=rbd \
@@ -39,7 +39,7 @@ docker plugin install ghcr.io/r-oswald/rbd-swarm-mount-plugin:4.2.0 \
 Optional read-only alias on nodes that need read-only consumers:
 
 ```bash
-docker plugin install ghcr.io/r-oswald/rbd-swarm-mount-plugin-ro:4.2.0 \
+docker plugin install ghcr.io/r-oswald/rbd-swarm-mount-plugin-ro:4.2.1 \
   --alias rbd-ro \
   --grant-all-permissions \
   RBD_CONF_POOL=rbd \

@@ -3,7 +3,7 @@ FROM quay.io/ceph/ceph:v19.2.4 as go-builder
 LABEL org.opencontainers.image.source="https://github.com/r-oswald/rbd-swarm-mount-plugin"
 LABEL org.opencontainers.image.description="Docker volume plugin for Ceph RBD"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.version="4.2.0"
+LABEL org.opencontainers.image.version="4.2.1"
 
 ENV GO_VERSION 1.26.3
 ENV CEPH_VERSION squid
@@ -41,7 +41,7 @@ FROM quay.io/ceph/ceph:v19.2.4
 LABEL org.opencontainers.image.source="https://github.com/r-oswald/rbd-swarm-mount-plugin"
 LABEL org.opencontainers.image.description="Docker volume plugin for Ceph RBD"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.version="4.2.0"
+LABEL org.opencontainers.image.version="4.2.1"
 
 RUN mkdir -p /run/docker/plugins /mnt/state /mnt/volumes /etc/ceph
 

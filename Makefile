@@ -1,6 +1,6 @@
 PLUGIN_NAME=ghcr.io/r-oswald/rbd-swarm-mount-plugin
 PLUGIN_NAME_RO=ghcr.io/r-oswald/rbd-swarm-mount-plugin-ro
-PLUGIN_VERSION=4.2.0
+PLUGIN_VERSION=4.2.1
 
 PLUGIN_PLATFORM=linux/amd64
 
